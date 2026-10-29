@@ -119,6 +119,10 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
                                                                              "JNI_GetCreatedJavaVMs");
     LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
+    if (!libart || !JNI_GetCreatedJavaVMs) {
+        LOGE("libart or JNI_GetCreatedJavaVMs unavailable");
+        return false;
+    }
     JavaVM *vms_buf[1];
     JavaVM *vms;
     jsize num_vms;
@@ -151,13 +155,30 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
         LOGI("nb %p", nb);
         auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
         if (callbacks) {
+            LOGI("NativeBridge interface version: %u", callbacks->version);
             LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
             LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
             LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
 
+            // Do not invoke unresolved callbacks on an incompatible native bridge.
+            if (!callbacks->getTrampoline ||
+                (api_level >= 26 ? !callbacks->loadLibraryExt : !callbacks->loadLibrary)) {
+                LOGE("NativeBridge callbacks unavailable: incompatible interface or initialization state");
+                return false;
+            }
+
             int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
+            if (fd < 0 || ftruncate(fd, (off_t) length) != 0) {
+                LOGE("Unable to create or resize staging memfd");
+                if (fd >= 0) close(fd);
+                return false;
+            }
             void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
+            if (mem == MAP_FAILED) {
+                LOGE("Unable to map staging memfd");
+                close(fd);
+                return false;
+            }
             memcpy(mem, data, length);
             munmap(mem, length);
             munmap(data, length);
@@ -177,11 +198,20 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
                                                                                   "JNI_OnLoad",
                                                                                   nullptr, 0);
                 LOGI("JNI_OnLoad %p", init);
+                if (!init) {
+                    LOGE("NativeBridge trampoline unavailable");
+                    close(fd);
+                    return false;
+                }
                 init(vms, (void *) game_data_dir);
                 return true;
             }
             close(fd);
+        } else {
+            LOGE("NativeBridgeItf symbol not available");
         }
+    } else {
+        LOGE("NativeBridge library could not be opened");
     }
     return false;
 }
